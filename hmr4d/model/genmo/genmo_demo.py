@@ -556,7 +556,15 @@ class GENMO_demo(pl.LightningModule):
         return batch
 
     @torch.no_grad()
-    def predict(self, data, static_cam=False):
+    def predict(
+        self,
+        data,
+        static_cam=False,
+        sampling_noise=None,
+        generator=None,
+        contact_guidance=None,
+        postproc_override=None,
+    ):
         # ROPE inference
         test_mode = data["meta"][0].get("mode", "default")
         batch = {
@@ -648,7 +656,9 @@ class GENMO_demo(pl.LightningModule):
             batch, cond_mask_cfg=None, mode=None, train=False
         )
 
-        if self.pipeline.args.infer_version == 3:
+        if postproc_override is not None:
+            postproc = bool(postproc_override)
+        elif self.pipeline.args.infer_version == 3:
             postproc = False
         else:
             postproc = True
@@ -658,6 +668,9 @@ class GENMO_demo(pl.LightningModule):
             postproc=postproc,
             static_cam=static_cam,
             test_mode=test_mode,
+            sampling_noise=sampling_noise,
+            generator=generator,
+            contact_guidance=contact_guidance,
         )
 
         _, pred_coco17_joints_global = self.smplxcoco17(**outputs["pred_smpl_params_global"])
@@ -687,7 +700,7 @@ class GENMO_demo(pl.LightningModule):
             with torch.cuda.amp.autocast(enabled=False):
                 max_text_len = self.max_text_len
 
-                encoded = self.tokenizer.batch_encode_plus(
+                encoded = self.tokenizer(
                     raw_text,
                     return_tensors="pt",
                     padding="max_length",

@@ -274,7 +274,7 @@ class GENMO(pl.LightningModule):
             with torch.cuda.amp.autocast(enabled=False):
                 max_text_len = self.max_text_len
 
-                encoded = self.tokenizer.batch_encode_plus(
+                encoded = self.tokenizer(
                     raw_text,
                     return_tensors="pt",
                     padding="max_length",

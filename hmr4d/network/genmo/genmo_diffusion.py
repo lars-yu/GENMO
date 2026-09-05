@@ -155,7 +155,14 @@ class GENMODiffusion(nn.Module):
 
         return output
 
-    def forward_test(self, inputs, progress=False):
+    def forward_test(
+        self,
+        inputs,
+        progress=False,
+        sampling_noise=None,
+        generator=None,
+        denoised_fn=None,
+    ):
         assert not self.training, "forward_test should only be called during inference"
         diffusion = self.test_gen_only_diffusion
 
@@ -200,12 +207,22 @@ class GENMODiffusion(nn.Module):
         else:
             raise NotImplementedError(f"Sampler {diff_sampler} not implemented")
 
-        if self.args.get("force_zero_noise", False):
+        if sampling_noise is not None:
+            if sampling_noise.shape != motion.shape:
+                raise ValueError(
+                    f"sampling_noise shape {sampling_noise.shape} != motion shape {motion.shape}"
+                )
+            noise = sampling_noise.to(device=motion.device, dtype=motion.dtype)
+        elif self.args.get("force_zero_noise", False):
             noise = torch.zeros_like(motion)
         elif self.args.get("force_rand_noise", False):
-            noise = torch.randn_like(motion)
+            noise = torch.randn(
+                motion.shape, device=motion.device, dtype=motion.dtype, generator=generator
+            )
         else:
-            noise = torch.randn_like(motion)
+            noise = torch.randn(
+                motion.shape, device=motion.device, dtype=motion.dtype, generator=generator
+            )
 
         if self.args.get("return_mid", False):
             kwargs["return_mid"] = True
@@ -220,9 +237,16 @@ class GENMODiffusion(nn.Module):
             progress=progress,
             dump_steps=None,
             noise=noise,
+            denoised_fn=denoised_fn,
             const_noise=False,
             **kwargs,
         )
+        if denoised_fn is not None:
+            # The sampler's auxiliary ``pred_x`` is the raw denoiser head.  At
+            # t=0, ``sample`` is the x0 after denoised_fn and is the motion that
+            # must be decoded for a guided run.
+            denoise_out["pred_x"] = denoise_out["sample"]
+            denoise_out["pred_x_start"] = denoise_out["sample"]
         output = denoise_out.copy()
 
         for x in self.args.out_attr:
@@ -238,8 +262,16 @@ class GENMODiffusion(nn.Module):
         mode=None,
         test_mode=None,
         normalizer_stats=None,
+        sampling_noise=None,
+        generator=None,
+        denoised_fn=None,
     ):
         if train:
             return self.forward_train(inputs, mode=mode)
         else:
-            return self.forward_test(inputs)
+            return self.forward_test(
+                inputs,
+                sampling_noise=sampling_noise,
+                generator=generator,
+                denoised_fn=denoised_fn,
+            )

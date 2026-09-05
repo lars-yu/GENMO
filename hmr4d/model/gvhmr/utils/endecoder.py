@@ -257,6 +257,38 @@ class EnDecoder(nn.Module):
         else:
             return joints, mat, fk_mat
 
+    def fk_v2_rotmat(
+        self,
+        body_pose_rotmat,
+        betas,
+        global_orient_rotmat=None,
+        transl=None,
+        get_intermediate=False,
+    ):
+        """Differentiable FK from rotation matrices, avoiding AA round trips."""
+        B, L = body_pose_rotmat.shape[:2]
+        if global_orient_rotmat is None:
+            global_orient_rotmat = torch.eye(
+                3, device=body_pose_rotmat.device, dtype=body_pose_rotmat.dtype
+            ).expand(B, L, 3, 3)
+        rotmat = torch.cat(
+            (global_orient_rotmat[:, :, None], body_pose_rotmat), dim=2
+        )
+        skeleton = self.smplx_model.get_skeleton(betas)[..., :22, :]
+        local_skeleton = skeleton - skeleton[:, :, self.parents_tensor]
+        local_skeleton = torch.cat(
+            (skeleton[:, :, :1], local_skeleton[:, :, 1:]), dim=2
+        )
+        if transl is not None:
+            local_skeleton = local_skeleton.clone()
+            local_skeleton[..., 0, :] += transl
+        mat = matrix.get_TRS(rotmat, local_skeleton)
+        fk_mat = matrix.forward_kinematics(mat, self.parents)
+        joints = matrix.get_position(fk_mat)
+        if get_intermediate:
+            return joints, mat, fk_mat
+        return joints
+
     def get_local_pos(self, betas):
         skeleton = self.smplx_model.get_skeleton(betas)[..., :22, :]  # (B, L, 22, 3)
         local_skeleton = skeleton - skeleton[:, :, self.parents_tensor]

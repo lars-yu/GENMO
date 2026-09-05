@@ -29,6 +29,12 @@ from motiondiff.models.mdm.rotation_conversions import (
     rotation_6d_to_matrix,
 )
 
+from hmr4d.model.genmo.contact_guidance import (
+    WRIST_JOINT_INDEX,
+    WRIST_TO_PALM_OFFSET_M,
+    make_contact_guidance,
+)
+
 
 class Pipeline(nn.Module):
     def __init__(self, args, args_denoiser3d, **kwargs):
@@ -56,8 +62,16 @@ class Pipeline(nn.Module):
         mode=None,
         test_mode=None,
         normalizer_stats=None,
+        sampling_noise=None,
+        generator=None,
+        contact_guidance=None,
     ):
         outputs = dict()
+
+        guidance = make_contact_guidance(
+            contact_guidance,
+            lambda x0, hand: self.decode_palm_position(x0, inputs, hand),
+        )
 
         # Forward & output
         model_output = self.denoiser3d(
@@ -68,6 +82,9 @@ class Pipeline(nn.Module):
             mode=mode,
             test_mode=test_mode,
             normalizer_stats=normalizer_stats,
+            sampling_noise=sampling_noise,
+            generator=generator,
+            denoised_fn=guidance,
         )  # pred_x, pred_cam, static_conf_logits
         decode_dict = self.endecoder.decode(model_output["pred_x"])  # (B, L, C) -> dict
         outputs.update({"model_output": model_output, "decode_dict": decode_dict})
@@ -225,6 +242,8 @@ class Pipeline(nn.Module):
                 if "pred_smpl_params_incam" in outputs:
                     outputs["pred_smpl_params_incam"]["body_pose"] = body_pose
 
+            if guidance is not None:
+                outputs["contact_guidance_steps"] = guidance.step_diagnostics
             return outputs
 
         # ========== Compute Loss ========== #
@@ -262,6 +281,44 @@ class Pipeline(nn.Module):
 
         outputs["loss"] = total_loss
         return outputs
+
+    def decode_palm_position(self, x0, inputs, hand):
+        """Decode normalized GENMO x0 to a palm point in GENMO global metres."""
+        if self.args.get("infer_version", 2) != 2:
+            raise NotImplementedError(
+                "Contact-guidance POC currently supports GENMO infer_version=2 only"
+            )
+        denormalized = self.endecoder.denormalize(x0, "gvhmr")
+        B, L = x0.shape[:2]
+        body_pose_rotmat = rotation_6d_to_matrix(
+            denormalized[..., :126].reshape(B, L, 21, 6)
+        )
+        # Root orientation channels are immutable in both POC passes. Decode
+        # them without gradients; root velocity remains differentiable only
+        # when the fallback mask enables its three channels.
+        root_decoded = self.endecoder.decode(x0.detach())
+        world_root = get_smpl_params_w_Rt_v2(
+            global_orient_gv=root_decoded["global_orient_gv"],
+            local_transl_vel=denormalized[..., 148:151],
+            global_orient_c=root_decoded["global_orient"],
+            cam_angvel=inputs["cam_angvel"],
+        )
+        joints, _, global_transforms = self.endecoder.fk_v2_rotmat(
+            body_pose_rotmat=body_pose_rotmat,
+            betas=denormalized[..., 126:136].detach(),
+            global_orient_rotmat=axis_angle_to_matrix(world_root["global_orient"]),
+            transl=world_root["transl"],
+            get_intermediate=True,
+        )
+        hand = str(hand).lower()
+        wrist_index = WRIST_JOINT_INDEX[hand]
+        offset = torch.as_tensor(
+            WRIST_TO_PALM_OFFSET_M[hand], device=x0.device, dtype=x0.dtype
+        )
+        wrist_rotation = global_transforms[..., wrist_index, :3, :3]
+        return joints[..., wrist_index, :] + torch.einsum(
+            "...ij,j->...i", wrist_rotation, offset
+        )
 
 
 def compute_humanoid_loss(inputs, outputs, ppl, mode):
