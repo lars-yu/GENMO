@@ -217,6 +217,11 @@ class ContactGuidanceConfig:
     t0_max_inner_steps: int = 40
     inner_convergence_delta_m: float = 0.0002
     inner_convergence_patience: int = 3
+    # v25c: the t=0 inner loop keeps optimizing until the post-contact follow is
+    # also within this target (not just the contact frame), so the hand tracks
+    # the lifted object instead of the loop quitting once the contact frame hits
+    # 2 cm.  <=0 keeps the legacy contact-frame-only stop.
+    post_contact_reach_threshold: float = 0.03
     # v25b: penalize the guided palm moving FASTER frame-to-frame than the
     # natural (reference) motion over the approach/contact window, beyond a small
     # slack.  This removes the "sudden velocity increase" (lunge) that a strong
@@ -1428,10 +1433,14 @@ class ContactGuidance:
             accepted_count = 0
             last_scale = 0.0
             inner_iterations = 0
-            # §4: keep the candidate with the MINIMUM contact-frame error seen
-            # across the inner loop, not merely the last accepted one.
+            # §4: keep the candidate with the MINIMUM combined (contact +
+            # post-contact) error seen across the inner loop, not the last one.
             best_current = current.clone()
-            best_error = float(before["contact_error_m"])
+            best_error = max(
+                float(before["contact_error_m"]),
+                float(before.get("post_contact_max_error_m", 0.0)),
+            )
+            best_contact_error = float(before["contact_error_m"])
             # §3: small-improvement patience for the convergence early-stop.
             conv_delta = float(self.config.inner_convergence_delta_m)
             conv_patience = max(1, int(self.config.inner_convergence_patience))
@@ -1529,18 +1538,26 @@ class ContactGuidance:
                         break
                 if not accepted:
                     break
-                # §4: keep the minimum-contact-error candidate; on a tie (e.g. a
-                # post-contact hold correction that does not change the contact
-                # frame) prefer the later accepted one, which also lowered the
-                # total loss — so valid updates are never discarded.
-                cur_err = float(last_metrics["contact_error_m"])
+                # §4/v25c: track the best candidate on a COMBINED error (contact
+                # frame + post-contact tracking).  The line search already forbids
+                # contact error from rising, so optimizing longer can only improve
+                # the post-contact follow — the hand keeps up with the lifted
+                # object instead of the loop quitting the moment the contact frame
+                # alone hits 2 cm and abandoning the follow.
+                cur_contact = float(last_metrics["contact_error_m"])
+                cur_post = float(last_metrics.get("post_contact_max_error_m", 0.0))
+                cur_err = max(cur_contact, cur_post)
                 improvement = best_error - cur_err
                 if cur_err <= best_error + 1e-9:
                     best_error = min(best_error, cur_err)
+                    best_contact_error = cur_contact
                     best_current = current.clone()
-                # §3: stop at the 2 cm reach target, or after `patience`
-                # consecutive iterations that improve contact error by < 0.2 mm.
-                if cur_err <= reach_threshold:
+                # §3: stop only when BOTH the contact frame and the post-contact
+                # follow are within their reach targets, or the improvement stalls.
+                post_reach = float(self.config.post_contact_reach_threshold)
+                if cur_contact <= reach_threshold and (
+                    post_reach <= 0.0 or cur_post <= post_reach
+                ):
                     break
                 small_improve_streak = (
                     small_improve_streak + 1 if improvement < conv_delta else 0
@@ -1610,8 +1627,8 @@ class ContactGuidance:
                 "inner_candidate_accepted": accepted_count,
                 "inner_line_search_scale": float(last_scale),
                 "inner_contact_error_before_m": float(before["contact_error_m"]),
-                # §4: the returned candidate is the best (min-error) one.
-                "inner_contact_error_after_m": float(best_error),
+                # §4: the returned candidate is the best (min combined-error) one.
+                "inner_contact_error_after_m": float(best_contact_error),
                 "inner_contact_error_last_m": float(last_metrics["contact_error_m"]),
             }
         return guided.detach().to(original_dtype), step_diag
