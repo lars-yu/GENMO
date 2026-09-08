@@ -217,6 +217,29 @@ class ContactGuidanceConfig:
     t0_max_inner_steps: int = 40
     inner_convergence_delta_m: float = 0.0002
     inner_convergence_patience: int = 3
+    # v25b: penalize the guided palm moving FASTER frame-to-frame than the
+    # natural (reference) motion over the approach/contact window, beyond a small
+    # slack.  This removes the "sudden velocity increase" (lunge) that a strong
+    # contact pull would otherwise back-load into the last few frames, without
+    # capping the reach itself.  <=0 disables.
+    palm_velocity_weight: float = 0.0
+    palm_velocity_slack_m: float = 0.005
+    # v25b: spread the reach across the approach window.  Instead of pulling
+    # every pre-contact frame toward the SAME static contact point (which
+    # back-loads the motion into a lunge 1-2 frames before contact), give each
+    # approach frame a target that ramps (smoothstep) from the natural reference
+    # palm to the contact point, so the palm moves a little every frame.
+    interpolate_pre_contact_target: bool = False
+    # v25b: minimum weight applied to pre-contact approach frames (0 = legacy
+    # 0->1 ramp).  A floor makes guidance move the palm throughout the approach
+    # instead of only in the last few frames.  Paired with the interpolated
+    # pre-contact target so the early pull is gentle (target ~= natural palm).
+    approach_weight_floor: float = 0.0
+    # v25b: hard line-search cap (metres/frame) on the max frame-to-frame palm
+    # step within the approach window.  Rejects any inner update that would make
+    # the hand lunge; the reach is forced to spread across the approach.  <=0
+    # disables (no cap).
+    approach_max_step_m: float = 0.0
     grad_clip_norm: float = 1.0
     # Legacy single-group caps.  Retained for backward compatibility with old
     # specs/tests; the v22 inner-loop path below no longer reads them.  The
@@ -601,15 +624,36 @@ class ContactGuidance:
                         "post_contact_surface_targets must have shape "
                         f"{expected_post_shape}, got {tuple(post_targets.shape)}"
                     )
-                # Keep the contact frame in the post-contact segment; the
-                # pre-contact target remains the static point up to frame-1.
-                target_seq = torch.cat(
-                    [
-                        pre_target.expand(1, max(frame, 0), 3),
-                        post_targets.reshape(1, -1, 3),
-                    ],
-                    dim=1,
-                )
+                # Keep the contact frame in the post-contact segment.  The
+                # pre-contact segment is either the static contact point (legacy)
+                # or a smoothstep interpolation from the natural reference palm to
+                # the contact point (v25b) that spreads the reach and removes the
+                # last-frame lunge.
+                if (
+                    bool(self.config.interpolate_pre_contact_target)
+                    and frame > 0
+                    and ref_palm.shape[1] >= frame + 1
+                ):
+                    transition = max(0, int(self.config.contact_transition_frames))
+                    a_start = max(0, frame - transition) if transition else 0
+                    idx = torch.arange(frame, device=base_x0.device, dtype=base_x0.dtype)
+                    denom = float(max(frame - a_start, 1))
+                    u = ((idx - a_start) / denom).clamp(0.0, 1.0)
+                    s = (u * u * (3.0 - 2.0 * u)).reshape(1, frame, 1)  # smoothstep
+                    natural = ref_palm[:, :frame, :]
+                    reach = pre_target.reshape(1, 1, 3) - ref_palm[:, frame:frame + 1, :]
+                    pre_seq = natural + s * reach
+                    target_seq = torch.cat(
+                        [pre_seq, post_targets.reshape(1, -1, 3)], dim=1
+                    )
+                else:
+                    target_seq = torch.cat(
+                        [
+                            pre_target.expand(1, max(frame, 0), 3),
+                            post_targets.reshape(1, -1, 3),
+                        ],
+                        dim=1,
+                    )
             else:
                 trajectory = trajectory.to(base_x0)
                 if trajectory.shape != (palm.shape[1], 3):
@@ -629,6 +673,14 @@ class ContactGuidance:
                     device=base_x0.device,
                     dtype=base_x0.dtype,
                 )
+                # v25b: lift the pre-contact weights to a floor so the WHOLE
+                # approach window is guided (not just the last few frames).  With
+                # a near-zero ramp the reach collapses into a 1-frame lunge; a
+                # floor lets each approach frame track its interpolated target so
+                # the reach spreads into a smooth, roughly constant-velocity move.
+                floor = float(self.config.approach_weight_floor)
+                if floor > 0.0:
+                    ramp = floor + (1.0 - floor) * ramp
                 weights[ramp_start : frame + 1] = ramp
             else:
                 ramp_start = frame
@@ -775,6 +827,29 @@ class ContactGuidance:
                     seg = palm[:, approach_lo:approach_hi, :]
                     approach_accel = seg[:, 2:] - 2.0 * seg[:, 1:-1] + seg[:, :-2]
                     approach_smoothness_loss = approach_accel.square().sum(dim=-1).mean()
+            # v25b: velocity-vs-reference penalty over the approach + a short
+            # post-contact window.  Penalize only the palm SPEED that exceeds the
+            # natural reference speed plus a small slack, so the hand cannot
+            # suddenly accelerate toward the object.
+            palm_velocity_loss = base_x0.new_zeros(())
+            palm_velocity_weight = float(self.config.palm_velocity_weight)
+            if palm_velocity_weight < 0.0 or not torch.isfinite(torch.tensor(palm_velocity_weight)):
+                raise ValueError("palm_velocity_weight must be finite and >= 0")
+            if palm_velocity_weight > 0.0:
+                cw_radius = max(0, int(self.config.contact_frame_weight_radius))
+                v_lo = int(ramp_start)
+                v_hi = min(frame + cw_radius + 1, palm.shape[1])
+                if v_hi - v_lo >= 2:
+                    cand_step = torch.linalg.vector_norm(
+                        palm[:, v_lo + 1:v_hi] - palm[:, v_lo:v_hi - 1], dim=-1
+                    )
+                    ref_step = torch.linalg.vector_norm(
+                        ref_palm[:, v_lo + 1:v_hi] - ref_palm[:, v_lo:v_hi - 1], dim=-1
+                    )
+                    slack = float(self.config.palm_velocity_slack_m)
+                    palm_velocity_loss = torch.relu(
+                        cand_step - ref_step - slack
+                    ).square().mean()
             # §1: independent contact-frame position term.  The weighted mean
             # above spreads one frame's error across ~30 frames; this term keeps
             # the contact frame (and a tiny post-contact window) as a first-class
@@ -791,6 +866,7 @@ class ContactGuidance:
                 + relative_velocity_weight * relative_velocity_loss
                 + float(self.config.penetration_weight) * penetration_loss
                 + approach_weight * approach_smoothness_loss
+                + palm_velocity_weight * palm_velocity_loss
             )
         else:
             contact_loss = ((palm[:, start:end] - target) ** 2).sum(dim=-1).mean()
@@ -798,6 +874,7 @@ class ContactGuidance:
             target_seq = target.expand(1, palm.shape[1], 3)
             penetration_loss = base_x0.new_zeros(())
             contact_frame_position_loss = base_x0.new_zeros(())
+            palm_velocity_loss = base_x0.new_zeros(())
         delta = (x0 - reference) * mask
         reference_loss = delta.square().sum() / mask.sum().clamp_min(1.0) / x0.shape[1]
         if delta.shape[1] > 1:
@@ -984,6 +1061,7 @@ class ContactGuidance:
             "post_contact_max_distance": post_contact_max_distance,
             "worst_position_loss": worst_position_loss,
             "contact_frame_position_loss": contact_frame_position_loss,
+            "palm_velocity_loss": palm_velocity_loss,
             "penetration_loss": penetration_loss,
             "contact_weight": contact_weight,
             "palm": palm,
@@ -1276,6 +1354,20 @@ class ContactGuidance:
                 )
             else:
                 root_step = 0.0
+            # v25b: max frame-to-frame palm step within the APPROACH window (up to
+            # the contact frame).  Post-contact steps are excluded — there the hand
+            # legitimately tracks the moving object.  Used as a hard line-search
+            # limit so the reach is spread instead of lunging in one frame.
+            transition = max(0, int(self.config.contact_transition_frames))
+            a_start = max(0, frame - transition)
+            a_hi = min(frame + 1, palm.shape[1])
+            if a_hi - a_start >= 2:
+                approach_step = torch.linalg.vector_norm(
+                    palm[:, a_start + 1:a_hi] - palm[:, a_start:a_hi - 1], dim=-1
+                )
+                approach_max_step = float(approach_step.max().detach().cpu())
+            else:
+                approach_max_step = 0.0
         def _f(key):
             v = comps.get(key)
             return float(v.detach().cpu()) if torch.is_tensor(v) else float(v or 0.0)
@@ -1288,6 +1380,7 @@ class ContactGuidance:
             "post_contact_max_error_m": post_contact_max_m,
             "max_palm_adjacent_jump_m": palm_move,
             "max_palm_step_m": palm_move,
+            "approach_max_step_m": approach_max_step,
             "root_step_m": root_step,
             "foot_slide_m": _f("foot_slide_m"),
             "root_target_loss": _f("root_target_loss"),
@@ -1400,6 +1493,8 @@ class ContactGuidance:
                 cur_total = float(total_loss.detach().cpu())
                 cur_contact_error = float(last_metrics["contact_error_m"])
                 contact_tol = 2e-4  # §5: ~0.2 mm, effectively non-increasing
+                approach_step_limit = float(self.config.approach_max_step_m)
+                cur_approach_step = float(last_metrics.get("approach_max_step_m", 0.0))
                 accepted = False
                 for scale in ([1.0, 0.5, 0.25, 0.125] if line_search else [1.0]):
                     candidate = current - scale * update
@@ -1409,12 +1504,22 @@ class ContactGuidance:
                         timestep,
                         base_palm=base_palm,
                     )
+                    # v25b: reject a candidate that would lunge — the approach
+                    # palm step may not exceed the cap, unless it does not make an
+                    # already-over-cap step any worse (so a converged state is not
+                    # frozen out).
+                    approach_ok = (
+                        approach_step_limit <= 0.0
+                        or metrics["approach_max_step_m"] <= approach_step_limit
+                        or metrics["approach_max_step_m"] <= cur_approach_step + 1e-6
+                    )
                     if (not line_search) or (
                         metrics["total_loss"] < cur_total
                         and metrics["contact_error_m"] <= cur_contact_error + contact_tol
                         and metrics["max_palm_step_m"] <= palm_jump_limit
                         and metrics["root_step_m"] <= root_step_limit
                         and metrics["foot_slide_m"] <= foot_slide_limit
+                        and approach_ok
                     ):
                         current = candidate
                         last_metrics = metrics
