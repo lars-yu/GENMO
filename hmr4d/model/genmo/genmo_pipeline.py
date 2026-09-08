@@ -70,7 +70,7 @@ class Pipeline(nn.Module):
 
         guidance = make_contact_guidance(
             contact_guidance,
-            lambda x0, hand: self.decode_palm_position(x0, inputs, hand),
+            lambda x0, hand: self.decode_guidance_kinematics(x0, inputs, hand),
         )
 
         # Forward & output
@@ -319,6 +319,66 @@ class Pipeline(nn.Module):
         return joints[..., wrist_index, :] + torch.einsum(
             "...ij,j->...i", wrist_rotation, offset
         )
+
+    def decode_guidance_kinematics(self, x0, inputs, hand):
+        """Whole-body differentiable decode used by v23 contact guidance.
+
+        Returns palm position/rotation, root position, and the four foot
+        joints (ordered to match the GENMO ``static_conf`` foot channels
+        ``[L_ankle, L_foot, R_ankle, R_foot]``), all in GENMO global metres.
+        Gradients flow to the arm/leg body-pose 6D channels and the root
+        velocity channels (148:151); root orientation and betas stay detached,
+        matching ``decode_palm_position``.
+        """
+        from hmr4d.utils.body_model.utils import SMPLH_JOINT_NAMES
+
+        if self.args.get("infer_version", 2) != 2:
+            raise NotImplementedError(
+                "Contact-guidance POC currently supports GENMO infer_version=2 only"
+            )
+        denormalized = self.endecoder.denormalize(x0, "gvhmr")
+        B, L = x0.shape[:2]
+        body_pose_rotmat = rotation_6d_to_matrix(
+            denormalized[..., :126].reshape(B, L, 21, 6)
+        )
+        root_decoded = self.endecoder.decode(x0.detach())
+        world_root = get_smpl_params_w_Rt_v2(
+            global_orient_gv=root_decoded["global_orient_gv"],
+            local_transl_vel=denormalized[..., 148:151],
+            global_orient_c=root_decoded["global_orient"],
+            cam_angvel=inputs["cam_angvel"],
+        )
+        joints, _, global_transforms = self.endecoder.fk_v2_rotmat(
+            body_pose_rotmat=body_pose_rotmat,
+            betas=denormalized[..., 126:136].detach(),
+            global_orient_rotmat=axis_angle_to_matrix(world_root["global_orient"]),
+            transl=world_root["transl"],
+            get_intermediate=True,
+        )
+        hand = str(hand).lower()
+        wrist_index = WRIST_JOINT_INDEX[hand]
+        offset = torch.as_tensor(
+            WRIST_TO_PALM_OFFSET_M[hand], device=x0.device, dtype=x0.dtype
+        )
+        wrist_rotation = global_transforms[..., wrist_index, :3, :3]
+        palm = joints[..., wrist_index, :] + torch.einsum(
+            "...ij,j->...i", wrist_rotation, offset
+        )
+        # Derive foot joint indices by name (never hardcode); order matches the
+        # 4 foot channels of static_conf_logits: L_ankle, L_foot, R_ankle, R_foot.
+        foot_idx = [
+            SMPLH_JOINT_NAMES.index(name)
+            for name in ("left_ankle", "left_foot", "right_ankle", "right_foot")
+        ]
+        foot_positions = torch.stack(
+            [joints[..., idx, :] for idx in foot_idx], dim=-2
+        )  # (B, L, 4, 3)
+        return {
+            "palm_position": palm,
+            "palm_rotation": wrist_rotation,
+            "root_position": joints[..., 0, :],
+            "foot_positions": foot_positions,
+        }
 
 
 def compute_humanoid_loss(inputs, outputs, ppl, mode):
