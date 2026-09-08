@@ -208,6 +208,15 @@ class ContactGuidanceConfig:
     post_contact_terminal_frames: int = 16
     contact_frame_position_weight: float = 2.0
     contact_frame_weight_radius: int = 2
+    # v25 contact-closure: an INDEPENDENT contact-frame position term (not folded
+    # into the ~30-frame weighted average) so the single contact frame is not
+    # diluted; and a longer t=0 inner loop that runs the arm+torso to real
+    # convergence (2 cm, or 3 consecutive improvements < 0.2 mm) instead of a
+    # fixed 10 steps, keeping the minimum-contact-error candidate.
+    contact_frame_direct_weight: float = 4.0
+    t0_max_inner_steps: int = 40
+    inner_convergence_delta_m: float = 0.0002
+    inner_convergence_patience: int = 3
     grad_clip_norm: float = 1.0
     # Legacy single-group caps.  Retained for backward compatibility with old
     # specs/tests; the v22 inner-loop path below no longer reads them.  The
@@ -476,7 +485,9 @@ class ContactGuidance:
         final = max(1, int(self.config.final_inner_steps))
         threshold = max(0, int(self.config.inner_step_late_threshold))
         if t == 0:
-            return final
+            # §3: run the final clean-x0 step to convergence (up to this cap; the
+            # loop below early-stops at 2 cm or on the small-improvement patience).
+            return max(final, int(self.config.t0_max_inner_steps))
         if t <= threshold:
             return late
         return 1
@@ -764,8 +775,18 @@ class ContactGuidance:
                     seg = palm[:, approach_lo:approach_hi, :]
                     approach_accel = seg[:, 2:] - 2.0 * seg[:, 1:-1] + seg[:, :-2]
                     approach_smoothness_loss = approach_accel.square().sum(dim=-1).mean()
+            # §1: independent contact-frame position term.  The weighted mean
+            # above spreads one frame's error across ~30 frames; this term keeps
+            # the contact frame (and a tiny post-contact window) as a first-class
+            # objective so closing to the 2 cm hold target is not averaged away.
+            # It uses the SAME hold-aware residual as position_loss (zero gradient
+            # once within the hold radius) and never touches pre-contact frames.
+            cw_radius = max(0, int(self.config.contact_frame_weight_radius))
+            cw_hi = min(palm.shape[1], frame + cw_radius + 1)
+            contact_frame_position_loss = effective_residual[:, frame:cw_hi].mean()
             contact_loss = (
                 position_loss
+                + float(self.config.contact_frame_direct_weight) * contact_frame_position_loss
                 + worst_weight * worst_position_loss
                 + relative_velocity_weight * relative_velocity_loss
                 + float(self.config.penetration_weight) * penetration_loss
@@ -776,6 +797,7 @@ class ContactGuidance:
             worst_position_loss = base_x0.new_zeros(())
             target_seq = target.expand(1, palm.shape[1], 3)
             penetration_loss = base_x0.new_zeros(())
+            contact_frame_position_loss = base_x0.new_zeros(())
         delta = (x0 - reference) * mask
         reference_loss = delta.square().sum() / mask.sum().clamp_min(1.0) / x0.shape[1]
         if delta.shape[1] > 1:
@@ -961,6 +983,7 @@ class ContactGuidance:
             "post_contact_position_loss": post_contact_position_loss,
             "post_contact_max_distance": post_contact_max_distance,
             "worst_position_loss": worst_position_loss,
+            "contact_frame_position_loss": contact_frame_position_loss,
             "penetration_loss": penetration_loss,
             "contact_weight": contact_weight,
             "palm": palm,
@@ -1312,6 +1335,14 @@ class ContactGuidance:
             accepted_count = 0
             last_scale = 0.0
             inner_iterations = 0
+            # §4: keep the candidate with the MINIMUM contact-frame error seen
+            # across the inner loop, not merely the last accepted one.
+            best_current = current.clone()
+            best_error = float(before["contact_error_m"])
+            # §3: small-improvement patience for the convergence early-stop.
+            conv_delta = float(self.config.inner_convergence_delta_m)
+            conv_patience = max(1, int(self.config.inner_convergence_patience))
+            small_improve_streak = 0
             grad_diag = {"gradient_norm": 0.0, "sequence_gradient_norm": 0.0,
                          "arm_gradient_norm": 0.0, "torso_gradient_norm": 0.0,
                          "root_gradient_norm": 0.0, "leg_gradient_norm": 0.0}
@@ -1362,13 +1393,13 @@ class ContactGuidance:
                 for key, value in norms.items():
                     norms_acc[key] = max(norms_acc.get(key, 0.0), value)
 
-                # §10: accept on the FULL loss, not contact alone, and reject any
-                # update that increases contact error or violates the palm-jump /
-                # root-step / foot-slide safety limits — so a few-mm contact gain
-                # can no longer buy a body-warp or a foot slide.
+                # §10 accept on the FULL loss + safety limits, and §5: never let a
+                # reference-loss reduction buy a contact-error increase — the
+                # contact error may not grow beyond floating-point noise, so it
+                # cannot accumulate across iterations.
                 cur_total = float(total_loss.detach().cpu())
                 cur_contact_error = float(last_metrics["contact_error_m"])
-                contact_tol = 1e-3
+                contact_tol = 2e-4  # §5: ~0.2 mm, effectively non-increasing
                 accepted = False
                 for scale in ([1.0, 0.5, 0.25, 0.125] if line_search else [1.0]):
                     candidate = current - scale * update
@@ -1393,9 +1424,27 @@ class ContactGuidance:
                         break
                 if not accepted:
                     break
-                if last_metrics["contact_error_m"] <= reach_threshold:
+                # §4: keep the minimum-contact-error candidate; on a tie (e.g. a
+                # post-contact hold correction that does not change the contact
+                # frame) prefer the later accepted one, which also lowered the
+                # total loss — so valid updates are never discarded.
+                cur_err = float(last_metrics["contact_error_m"])
+                improvement = best_error - cur_err
+                if cur_err <= best_error + 1e-9:
+                    best_error = min(best_error, cur_err)
+                    best_current = current.clone()
+                # §3: stop at the 2 cm reach target, or after `patience`
+                # consecutive iterations that improve contact error by < 0.2 mm.
+                if cur_err <= reach_threshold:
+                    break
+                small_improve_streak = (
+                    small_improve_streak + 1 if improvement < conv_delta else 0
+                )
+                if small_improve_streak >= conv_patience:
                     break
 
+            # §4: return the minimum-contact-error candidate, not the last one.
+            current = best_current
             guided = self._assemble(base_x0, active_indices, current)
             if not torch.isfinite(guided).all():
                 raise FloatingPointError("GENMO guided x0 contains NaN/Inf")
@@ -1456,7 +1505,9 @@ class ContactGuidance:
                 "inner_candidate_accepted": accepted_count,
                 "inner_line_search_scale": float(last_scale),
                 "inner_contact_error_before_m": float(before["contact_error_m"]),
-                "inner_contact_error_after_m": float(last_metrics["contact_error_m"]),
+                # §4: the returned candidate is the best (min-error) one.
+                "inner_contact_error_after_m": float(best_error),
+                "inner_contact_error_last_m": float(last_metrics["contact_error_m"]),
             }
         return guided.detach().to(original_dtype), step_diag
 
