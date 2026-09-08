@@ -194,8 +194,12 @@ class ContactGuidanceConfig:
     # rotates with the object), so the hand mesh rests on the surface instead
     # of clipping through it as the object is lifted/rotated.
     object_surface_normals: Optional[torch.Tensor] = None  # [T,3] outward, guidance-global
-    contact_min_clearance: float = 0.04
-    penetration_weight: float = 60.0
+    # v24: the palm-point guidance target is the TRUE surface point (no standoff),
+    # and full-hand-mesh penetration is left to the separate finger stage, so the
+    # GENMO-stage clearance/penetration terms are off by default.  A positive
+    # clearance must never exceed the post-contact hold radius (checked below).
+    contact_min_clearance: float = 0.0
+    penetration_weight: float = 0.0
     # Give frames outside the hold region an additional max-error signal so
     # the average loss cannot hide a brief visible release.
     post_contact_worst_frame_weight: float = 0.5
@@ -279,6 +283,17 @@ class ContactGuidanceConfig:
     # frames; penalizing acceleration spreads the reach into a smooth, roughly
     # constant-velocity approach.  <=0 disables.
     approach_smoothness_weight: float = 0.0
+    # v24 whole-body action terms.  Root velocity residual (candidate vs the
+    # desired reference+ramp trajectory) so gradients shape 148:151 correctly and
+    # the post-contact residual returns to zero.  Torso reference/temporal keep
+    # the chest from twisting.  Elbow-direction keeps the natural bend plane.
+    w_root_velocity: float = 1.0
+    torso_reference_weight: float = 0.0
+    torso_smoothness_weight: float = 0.0
+    elbow_direction_weight: float = 0.0
+    # Line-search safety: reject a candidate whose support-foot slide (candidate
+    # foot velocity relative to the reference motion, metres/frame) exceeds this.
+    foot_slide_limit: float = 0.05
     diffusion_steps: int = 50
     human_depth_scale: float = 1.0
     camera_origin_global: Optional[torch.Tensor] = None
@@ -286,6 +301,16 @@ class ContactGuidanceConfig:
     # metres) added to every decoded human point so the frame-0 human depth
     # matches GT.  No scaling, no betas change -> body size is preserved.
     human_translation_global: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        # Regression guard: if clearance is ever re-enabled it must not exceed
+        # the post-contact hold radius, or the palm target becomes unsatisfiable
+        # (must be >= clearance off the surface AND <= hold_radius from it).
+        if float(self.contact_min_clearance) > float(self.post_contact_hold_radius) + 1e-9:
+            raise ValueError(
+                "contact_min_clearance must be <= post_contact_hold_radius "
+                f"(got {self.contact_min_clearance} > {self.post_contact_hold_radius})"
+            )
 
 
 class ContactGuidance:
@@ -513,6 +538,22 @@ class ContactGuidance:
             return p
 
         palm = _place_human(palm)
+        # v24: decode the frozen baseline (reference) kinematics ONCE and place
+        # them in the same frame-0 aligned coordinates as the candidate.  The
+        # root/foot/arm terms below are residuals on THIS natural motion, so the
+        # original walk/bend/gait is preserved instead of collapsing to frame 0.
+        if getattr(self, "_ref_kin_raw", None) is None:
+            self._ref_kin_raw = {
+                k: v.detach() for k, v in self._decode_kinematics(reference).items()
+            }
+        ref_kin = self._ref_kin_raw
+        ref_palm = _place_human(ref_kin["palm_position"])
+        ref_root = (
+            _place_human(ref_kin["root_position"]) if "root_position" in ref_kin else None
+        )
+        ref_feet = (
+            _place_human(ref_kin["foot_positions"]) if "foot_positions" in ref_kin else None
+        )
         frame = int(self.config.contact_frame)
         start = max(0, frame - int(self.config.contact_window_radius))
         end = min(palm.shape[1], frame + int(self.config.contact_window_radius) + 1)
@@ -756,7 +797,59 @@ class ContactGuidance:
             arm_accel = arm_delta[:, 2:] - 2.0 * arm_delta[:, 1:-1] + arm_delta[:, :-2]
             arm_smoothness_loss = arm_accel.square().mean()
 
-        # ---- Whole-body root / foot terms (§五,§七), whole-body candidate only ----
+        # §8.1 SO(3) geodesic arm reference (preferred over raw 6D-channel L2)
+        # and §8.2 elbow-direction, only when the kinematics callback exposes
+        # per-joint rotations / joint positions (the real GENMO decode does).
+        arm_geodesic_loss = base_x0.new_zeros(())
+        arm_geodesic_per_joint = None
+        elbow_direction_loss = base_x0.new_zeros(())
+        if "arm_rotations" in kin and "arm_rotations" in ref_kin:
+            Rc = kin["arm_rotations"]  # [B,T,4,3,3] collar/shoulder/elbow/wrist
+            Rr = ref_kin["arm_rotations"].to(Rc)
+            R_delta = Rc @ Rr.transpose(-1, -2)
+            trace = R_delta[..., 0, 0] + R_delta[..., 1, 1] + R_delta[..., 2, 2]
+            cos = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            angle = torch.acos(cos)  # [B,T,4], radians
+            arm_geodesic_loss = angle.square().mean()
+            arm_geodesic_per_joint = angle.square().mean(dim=(0, 1))  # [4]
+        pos_keys = ("shoulder_position", "elbow_position", "wrist_position")
+        if all(k in kin for k in pos_keys) and all(k in ref_kin for k in pos_keys):
+            def _elbow_plane_normal(kd):
+                sh = _place_human(kd["shoulder_position"])
+                el = _place_human(kd["elbow_position"])
+                wr = _place_human(kd["wrist_position"])
+                ua = torch.nn.functional.normalize(el - sh, dim=-1)
+                fa = torch.nn.functional.normalize(wr - el, dim=-1)
+                return torch.nn.functional.normalize(torch.cross(ua, fa, dim=-1), dim=-1)
+            n_cand = _elbow_plane_normal(kin)
+            n_ref = _elbow_plane_normal(ref_kin)
+            dot = (n_cand * n_ref).sum(dim=-1)  # [B,T] cos angle between planes
+            # Only penalize large deviations (>~60deg, dot<0.5); smooth change is free.
+            elbow_direction_loss = torch.relu(0.5 - dot).square().mean()
+        # Prefer the geodesic arm reference when rotations are available.
+        arm_reference_term = (
+            arm_geodesic_loss if arm_geodesic_per_joint is not None else arm_reference_loss
+        )
+
+        # §8.3 Torso reference + temporal (only meaningful when torso is active).
+        torso_reference_loss = base_x0.new_zeros(())
+        torso_smoothness_loss = base_x0.new_zeros(())
+        if self.config.include_torso:
+            torso_slices = group_channel_slices(self.config.selected_hand)["torso"]
+            torso_idx = torch.cat([
+                torch.arange(s.start, s.stop, device=base_x0.device) for s in torso_slices
+            ])
+            torso_delta = (x0 - reference).index_select(-1, torso_idx)
+            torso_reference_loss = torso_delta.square().mean()
+            if torso_delta.shape[1] > 2:
+                torso_accel = (
+                    torso_delta[:, 2:] - 2.0 * torso_delta[:, 1:-1] + torso_delta[:, :-2]
+                )
+                torso_smoothness_loss = torso_accel.square().mean()
+
+        # ---- Whole-body root / foot terms (§三,§四,§五,§九), whole-body only ----
+        root_velocity_loss = base_x0.new_zeros(())
+        foot_slide_m = 0.0
         root_target_loss = base_x0.new_zeros(())
         root_vertical_loss = base_x0.new_zeros(())
         support_foot_loss = base_x0.new_zeros(())
@@ -767,34 +860,60 @@ class ContactGuidance:
             # Same frame-0 placement (similarity and/or translation) as the palm.
             root_pos = _place_human(kin["root_position"])  # [B,T,3]
             feet = _place_human(kin["foot_positions"])  # [B,T,4,3]
-            root0 = root_pos[:, :1].detach()
-            # Vertical lock: root height must not change (no scaling/no vertical).
-            root_vertical_loss = ((root_pos - root0) * up).sum(dim=-1).square().mean()
-            # Ground-plane target: distribute the arm-only residual smoothly.
+            # v24: residuals are measured against the frozen REFERENCE motion,
+            # not frame 0, so the original walk/bend/gait survives.
+            ref_root_b = ref_root if ref_root is not None else root_pos.detach()
+            ref_feet_b = ref_feet if ref_feet is not None else feet.detach()
+            # §4 vertical: guidance may not change root height RELATIVE to the
+            # reference (the reference's own vertical motion is fully preserved).
+            root_vertical_loss = (
+                ((root_pos - ref_root_b) * up).sum(dim=-1).square().mean()
+            )
+            # §3 root target: desired_root = reference_root + residual ramp.
+            # The horizontal ground-plane delta is distributed by a smoothstep
+            # ramp (0 before approach_start, 1 at contact, held after).
             if self.config.root_target_delta_global is not None:
                 delta_g = self.config.root_target_delta_global.to(base_x0).reshape(1, 1, 3)
                 delta_g = delta_g - (delta_g * up).sum(dim=-1, keepdim=True) * up  # horizontal
-                ramp = self._root_offset_ramp(
-                    root_pos.shape[1], base_x0.device, base_x0.dtype
-                ).reshape(1, -1, 1)
-                target_root = root0 + ramp * delta_g
-                horiz = (root_pos - target_root)
-                horiz = horiz - (horiz * up).sum(dim=-1, keepdim=True) * up
-                root_target_loss = horiz.square().sum(dim=-1).mean()
-            # Support-foot no-slide + on-ground, weighted by contact probability.
-            # (feet already includes the rigid t0 offset from above.)
+            else:
+                delta_g = base_x0.new_zeros((1, 1, 3))
+            ramp = self._root_offset_ramp(
+                root_pos.shape[1], base_x0.device, base_x0.dtype
+            ).reshape(1, -1, 1)
+            desired_root = ref_root_b + ramp * delta_g
+            horiz = (root_pos - desired_root)
+            horiz = horiz - (horiz * up).sum(dim=-1, keepdim=True) * up
+            root_target_loss = horiz.square().sum(dim=-1).mean()
+            # §5 root velocity: match the desired-root velocity so gradients flow
+            # into 148:151 correctly; post-contact the residual is constant, so
+            # the residual velocity (candidate - reference) returns to zero.
+            if root_pos.shape[1] > 1:
+                candidate_vel = root_pos[:, 1:] - root_pos[:, :-1]
+                desired_vel = desired_root[:, 1:] - desired_root[:, :-1]
+                root_velocity_loss = (candidate_vel - desired_vel).square().sum(-1).mean()
+            # §9 feet: constrain RELATIVE to the reference motion (no absolute
+            # lock).  A swing foot that moves in the reference is free to move;
+            # only deviations from the reference are penalized, weighted by the
+            # contact probability, so both feet are never locked together.
             if self.config.foot_contact_probs is not None and feet.shape[1] > 1:
                 probs = self.config.foot_contact_probs.to(base_x0).reshape(1, -1, 4)
                 probs = probs[:, : feet.shape[1]]
-                foot_vel = feet[:, 1:] - feet[:, :-1]
-                slide = foot_vel.square().sum(dim=-1)  # [B,T-1,4]
-                support_foot_loss = (probs[:, 1:] * slide).sum() / probs[:, 1:].sum().clamp_min(1.0)
-                if self.config.ground_height is not None:
-                    height = (feet * up).sum(dim=-1)  # [B,T,4]
-                    ground = float(self.config.ground_height)
-                    ground_contact_loss = (
-                        probs * (height - ground).square()
-                    ).sum() / probs.sum().clamp_min(1.0)
+                cand_foot_vel = feet[:, 1:] - feet[:, :-1]
+                ref_foot_vel = ref_feet_b[:, 1:] - ref_feet_b[:, :-1]
+                vel_resid = (cand_foot_vel - ref_foot_vel).square().sum(dim=-1)  # [B,T-1,4]
+                support_foot_loss = (
+                    (probs[:, 1:] * vel_resid).sum() / probs[:, 1:].sum().clamp_min(1.0)
+                )
+                foot_slide_m = float(
+                    torch.sqrt(vel_resid.clamp_min(0.0)).max().detach().cpu()
+                )
+                # Ground contact relative to the reference foot height (never the
+                # global minimum, which would drag ankles down to the toes).
+                cand_h = (feet * up).sum(dim=-1)  # [B,T,4]
+                ref_h = (ref_feet_b * up).sum(dim=-1)
+                ground_contact_loss = (
+                    probs * (cand_h - ref_h).square()
+                ).sum() / probs.sum().clamp_min(1.0)
             # Legs stay close to the GENMO reference pose.
             leg_idx = torch.cat([
                 torch.arange(s.start, s.stop, device=base_x0.device)
@@ -807,10 +926,14 @@ class ContactGuidance:
             self.config.w_contact * contact_loss
             + self.config.w_reference * reference_loss
             + self.config.w_temporal * temporal_loss
-            + float(self.config.arm_reference_weight) * arm_reference_loss
+            + float(self.config.arm_reference_weight) * arm_reference_term
             + float(self.config.arm_smoothness_weight) * arm_smoothness_loss
+            + float(self.config.elbow_direction_weight) * elbow_direction_loss
+            + float(self.config.torso_reference_weight) * torso_reference_loss
+            + float(self.config.torso_smoothness_weight) * torso_smoothness_loss
             + float(self.config.w_root_target) * root_target_loss
             + float(self.config.w_root_vertical_lock) * root_vertical_loss
+            + float(self.config.w_root_velocity) * root_velocity_loss
             + float(self.config.support_foot_weight) * support_foot_loss
             + float(self.config.ground_contact_weight) * ground_contact_loss
             + float(self.config.leg_reference_weight) * leg_reference_loss
@@ -843,12 +966,19 @@ class ContactGuidance:
             "palm": palm,
             "target_seq": target_seq,
             "arm_reference_loss": arm_reference_loss,
+            "arm_geodesic_loss": arm_geodesic_loss,
+            "arm_geodesic_per_joint": arm_geodesic_per_joint,
             "arm_smoothness_loss": arm_smoothness_loss,
+            "elbow_direction_loss": elbow_direction_loss,
+            "torso_reference_loss": torso_reference_loss,
+            "torso_smoothness_loss": torso_smoothness_loss,
             "root_target_loss": root_target_loss,
             "root_vertical_loss": root_vertical_loss,
+            "root_velocity_loss": root_velocity_loss,
             "support_foot_loss": support_foot_loss,
             "ground_contact_loss": ground_contact_loss,
             "leg_reference_loss": leg_reference_loss,
+            "foot_slide_m": foot_slide_m,
             "kin": kin,
         }
         return total_loss, comps
@@ -895,18 +1025,13 @@ class ContactGuidance:
         """
         if root_grad.shape[-1] == 0:
             return root_grad
+        # v24: only Gaussian-smooth + reweight.  The old position ramp (0 before
+        # approach_start, 1 after contact) was multiplied onto the root-VELOCITY
+        # gradient, which pulled the whole approach trajectory back to frame 0 and
+        # kept editing the root after contact.  The approach shape now lives in
+        # the loss (desired_root = reference_root + ramp*delta, root_velocity_loss
+        # → 0 post-contact); the per-group DDIM schedule (0 at t=0) still applies.
         g = self._gaussian_time_smooth(root_grad, self.config.root_gradient_smooth_kernel)
-        frames = g.shape[1]
-        frame = int(self.config.contact_frame)
-        transition = max(0, int(self.config.contact_transition_frames))
-        approach_start = max(0, frame - transition) if transition else frame
-        ramp = torch.zeros(frames, device=g.device, dtype=g.dtype)
-        if frame > approach_start:
-            steps = frame - approach_start + 1
-            u = torch.linspace(0.0, 1.0, steps, device=g.device, dtype=g.dtype)
-            ramp[approach_start : frame + 1] = u * u * (3.0 - 2.0 * u)  # smoothstep
-        ramp[frame:] = 1.0
-        g = g * ramp.reshape(1, frames, 1)
         root_multiplier = float(self.config.root_guidance_multiplier)
         if not torch.isfinite(torch.tensor(root_multiplier)) or root_multiplier < 0.0:
             raise ValueError(
@@ -1105,7 +1230,7 @@ class ContactGuidance:
         reference motion is not rejected.
         """
         with torch.no_grad():
-            _, comps = self._compute_guidance_loss(x0, timestep)
+            total_loss_t, comps = self._compute_guidance_loss(x0, timestep)
             palm = comps["palm"]
             target_seq = comps["target_seq"]
             frame = int(self.config.contact_frame)
@@ -1128,12 +1253,27 @@ class ContactGuidance:
                 )
             else:
                 root_step = 0.0
+        def _f(key):
+            v = comps.get(key)
+            return float(v.detach().cpu()) if torch.is_tensor(v) else float(v or 0.0)
+
         return {
+            "total_loss": float(total_loss_t.detach().cpu()),
             "contact_loss": float(comps["contact_loss"].detach().cpu()),
             "contact_error_m": contact_error_m,
             "post_contact_max_m": post_contact_max_m,
+            "post_contact_max_error_m": post_contact_max_m,
             "max_palm_adjacent_jump_m": palm_move,
+            "max_palm_step_m": palm_move,
             "root_step_m": root_step,
+            "foot_slide_m": _f("foot_slide_m"),
+            "root_target_loss": _f("root_target_loss"),
+            "root_velocity_loss": _f("root_velocity_loss"),
+            "arm_reference_loss": _f("arm_reference_loss"),
+            "torso_reference_loss": _f("torso_reference_loss"),
+            "support_foot_loss": _f("support_foot_loss"),
+            "ground_contact_loss": _f("ground_contact_loss"),
+            "temporal_loss": _f("temporal_loss"),
         }
 
     def _run_inner_guidance(self, x0_pred: torch.Tensor, timestep: torch.Tensor):
@@ -1152,6 +1292,7 @@ class ContactGuidance:
             line_search = bool(self.config.inner_line_search)
             palm_jump_limit = float(self.config.inner_palm_jump_limit)
             root_step_limit = float(self.config.inner_root_step_limit)
+            foot_slide_limit = float(self.config.foot_slide_limit)
             reach_threshold = float(self.config.reach_error_threshold)
             n_inner = self._inner_step_schedule(timestep)
 
@@ -1221,7 +1362,13 @@ class ContactGuidance:
                 for key, value in norms.items():
                     norms_acc[key] = max(norms_acc.get(key, 0.0), value)
 
-                cur_loss = float(comps["contact_loss"].detach().cpu())
+                # §10: accept on the FULL loss, not contact alone, and reject any
+                # update that increases contact error or violates the palm-jump /
+                # root-step / foot-slide safety limits — so a few-mm contact gain
+                # can no longer buy a body-warp or a foot slide.
+                cur_total = float(total_loss.detach().cpu())
+                cur_contact_error = float(last_metrics["contact_error_m"])
+                contact_tol = 1e-3
                 accepted = False
                 for scale in ([1.0, 0.5, 0.25, 0.125] if line_search else [1.0]):
                     candidate = current - scale * update
@@ -1232,9 +1379,11 @@ class ContactGuidance:
                         base_palm=base_palm,
                     )
                     if (not line_search) or (
-                        metrics["contact_loss"] < cur_loss
-                        and metrics["max_palm_adjacent_jump_m"] <= palm_jump_limit
+                        metrics["total_loss"] < cur_total
+                        and metrics["contact_error_m"] <= cur_contact_error + contact_tol
+                        and metrics["max_palm_step_m"] <= palm_jump_limit
                         and metrics["root_step_m"] <= root_step_limit
+                        and metrics["foot_slide_m"] <= foot_slide_limit
                     ):
                         current = candidate
                         last_metrics = metrics

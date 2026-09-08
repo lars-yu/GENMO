@@ -373,11 +373,24 @@ class Pipeline(nn.Module):
         foot_positions = torch.stack(
             [joints[..., idx, :] for idx in foot_idx], dim=-2
         )  # (B, L, 4, 3)
+        # Selected-arm joint positions and world rotations (collar/shoulder/
+        # elbow/wrist), by name — used by v24 arm-reference (SO(3) geodesic) and
+        # elbow-direction guidance losses.  Order is fixed collar->wrist.
+        arm_joint_names = [f"{hand}_{j}" for j in ("collar", "shoulder", "elbow", "wrist")]
+        arm_idx = [SMPLH_JOINT_NAMES.index(name) for name in arm_joint_names]
+        arm_rotations = torch.stack(
+            [global_transforms[..., idx, :3, :3] for idx in arm_idx], dim=-3
+        )  # (B, L, 4, 3, 3)
+        collar_i, shoulder_i, elbow_i, wrist_i = arm_idx
         return {
             "palm_position": palm,
             "palm_rotation": wrist_rotation,
             "root_position": joints[..., 0, :],
             "foot_positions": foot_positions,
+            "shoulder_position": joints[..., shoulder_i, :],
+            "elbow_position": joints[..., elbow_i, :],
+            "wrist_position": joints[..., wrist_i, :],
+            "arm_rotations": arm_rotations,
         }
 
 
